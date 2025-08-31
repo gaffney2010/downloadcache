@@ -1,0 +1,24 @@
+syntax = "proto3";
+
+package downloadcache;
+
+// The go_package option specifies the import path for the generated Go code.
+option go_package = "github.com/your-username/downloadcache/pb";
+
+// The DownloadCache service definition.
+service DownloadCache {
+  // Fetches a URL, using a cache if available.
+  rpc Get(DownloadCacheRequest) returns (DownloadCacheResponse);
+}
+
+// The request message containing the URL and an invalidation flag.
+message DownloadCacheRequest {
+  string url = 1;
+  bool invalidate = 2;
+}
+
+// The response message containing the page contents.
+message DownloadCacheResponse {
+  string page_contents = 1;
+}
+
