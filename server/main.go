@@ -27,7 +27,7 @@ import (
 const (
 	defaultPort      = "50051"
 	defaultCacheDir  = "/cache" // This path will be used inside the Docker container
-	downloadTimeout  = 30 * time.Second
+	downloadTimeout  = 0 * time.Second
 )
 
 // downloadCacheServer implements the DownloadCacheServiceServer interface.
