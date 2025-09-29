@@ -7,7 +7,6 @@ import (
 	"io"
 	"log"
 	"net"
-	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -18,6 +17,7 @@ import (
 
 	"github.com/tdewolff/minify/v2"
 	"github.com/tdewolff/minify/v2/html"
+	"github.com/tebeka/selenium"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/reflection"
@@ -25,9 +25,10 @@ import (
 )
 
 const (
-	defaultPort      = "50051"
-	defaultCacheDir  = "/cache" // This path will be used inside the Docker container
-	downloadTimeout  = 30 * time.Second
+	defaultPort             = "50051"
+	defaultCacheDir         = "/cache"                // This path will be used inside the Docker container
+	defaultChromeDriverPath = "/usr/bin/chromedriver" // Common path in Docker images
+	defaultSeleniumPort     = "9515"
 )
 
 // downloadCacheServer implements the DownloadCacheServiceServer interface.
@@ -35,11 +36,12 @@ type downloadCacheServer struct {
 	pb.UnimplementedDownloadCacheServer
 	cacheDir string
 	minifier *minify.M
-	urlLocks sync.Map // Used to prevent concurrent downloads of the same URL
+	wd       selenium.WebDriver // Selenium WebDriver instance
+	urlLocks sync.Map           // Used to prevent concurrent downloads of the same URL
 }
 
 // newServer creates a new instance of our server.
-func newServer(cacheDir string) (*downloadCacheServer, error) {
+func newServer(cacheDir string, wd selenium.WebDriver) (*downloadCacheServer, error) {
 	if err := os.MkdirAll(cacheDir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create cache directory: %w", err)
 	}
@@ -52,11 +54,11 @@ func newServer(cacheDir string) (*downloadCacheServer, error) {
 	return &downloadCacheServer{
 		cacheDir: cacheDir,
 		minifier: m,
+		wd:       wd,
 	}, nil
 }
 
 // sanitizeURLForFilename creates a safe filename from a URL.
-// We use URL path escaping which is robust and reversible if needed.
 func sanitizeURLForFilename(rawURL string) string {
 	return url.PathEscape(rawURL)
 }
@@ -74,12 +76,10 @@ func (s *downloadCacheServer) Get(ctx context.Context, req *pb.DownloadCacheRequ
 
 	// --- Cache Check ---
 	if !req.GetInvalidate() {
-		// Check if the file exists.
 		if _, err := os.Stat(cacheFilePath); err == nil {
 			log.Printf("Cache HIT for URL: %s", req.GetUrl())
 			content, err := s.readFromCache(cacheFilePath)
 			if err != nil {
-				// If reading fails, treat it as a cache miss and proceed to download.
 				log.Printf("Failed to read from cache, proceeding to download: %v", err)
 			} else {
 				return &pb.DownloadCacheResponse{PageContents: content}, nil
@@ -92,8 +92,7 @@ func (s *downloadCacheServer) Get(ctx context.Context, req *pb.DownloadCacheRequ
 	return s.downloadAndCache(req.GetUrl(), cacheFilePath)
 }
 
-// downloadAndCache handles the logic for downloading, processing, and caching a URL.
-// It includes a lock to prevent a "thundering herd" problem for the same URL.
+// downloadAndCache handles the logic for downloading, processing, and caching a URL using Selenium.
 func (s *downloadCacheServer) downloadAndCache(rawURL, cacheFilePath string) (*pb.DownloadCacheResponse, error) {
 	// Lock per URL to ensure only one goroutine downloads a specific URL at a time.
 	mu, _ := s.urlLocks.LoadOrStore(rawURL, &sync.Mutex{})
@@ -111,31 +110,24 @@ func (s *downloadCacheServer) downloadAndCache(rawURL, cacheFilePath string) (*p
 		}
 	}
 
-	// Create a context with a timeout for the download.
-	ctx, cancel := context.WithTimeout(context.Background(), downloadTimeout)
-	defer cancel()
+	// --- Selenium Page Fetch ---
+	log.Printf("Fetching URL with Selenium: %s", rawURL)
+	if err := s.wd.Get(rawURL); err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to navigate to URL with Selenium %s: %v", rawURL, err)
+	}
 
-	// Perform the HTTP GET request.
-	httpReq, err := http.NewRequestWithContext(ctx, "GET", rawURL, nil)
+	// Optional: Wait for a specific element or just a fixed time for JavaScript to render.
+	// For production, a more robust explicit wait for an element is better.
+	// Example: s.wd.Wait(selenium.Until(selenium.TitleContains("Example")), 10*time.Second)
+	time.Sleep(2 * time.Second)
+
+	pageSource, err := s.wd.PageSource()
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to create HTTP request: %v", err)
+		return nil, status.Errorf(codes.Internal, "failed to get page source from Selenium: %v", err)
 	}
-	resp, err := http.DefaultClient.Do(httpReq)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to download URL %s: %v", rawURL, err)
-	}
-	defer resp.Body.Close()
+	bodyBytes := []byte(pageSource)
 
-	if resp.StatusCode != http.StatusOK {
-		return nil, status.Errorf(codes.Internal, "download failed with status code %d for URL %s", resp.StatusCode, rawURL)
-	}
-
-	bodyBytes, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to read response body: %v", err)
-	}
-
-	// Minify the content. We use MinifyBytes which is more direct.
+	// Minify the content.
 	minifiedBytes, err := s.minifier.Bytes("text/html", bodyBytes)
 	if err != nil {
 		log.Printf("Warning: failed to minify content for %s, using original. Error: %v", rawURL, err)
@@ -144,15 +136,13 @@ func (s *downloadCacheServer) downloadAndCache(rawURL, cacheFilePath string) (*p
 
 	// Write the minified and gzipped content to the cache file.
 	if err := s.writeToCache(cacheFilePath, minifiedBytes); err != nil {
-		// Log the error but don't fail the request, as we can still serve the content.
 		log.Printf("Error: failed to write to cache file %s: %v", cacheFilePath, err)
 	} else {
 		log.Printf("Successfully cached content for %s", rawURL)
 	}
-	
+
 	return &pb.DownloadCacheResponse{PageContents: string(minifiedBytes)}, nil
 }
-
 
 // readFromCache reads and decompresses content from a cache file.
 func (s *downloadCacheServer) readFromCache(path string) (string, error) {
@@ -192,7 +182,7 @@ func (s *downloadCacheServer) writeToCache(path string, content []byte) error {
 }
 
 func main() {
-	// Get config from environment variables with defaults
+	// --- Get config from environment variables ---
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = defaultPort
@@ -201,20 +191,50 @@ func main() {
 	if cacheDir == "" {
 		cacheDir = defaultCacheDir
 	}
+	// This URL will point to the Selenium container (e.g., "http://selenium:4444/wd/hub")
+	seleniumURL := os.Getenv("SELENIUM_URL")
+	if seleniumURL == "" {
+		log.Fatalf("SELENIUM_URL environment variable not set")
+	}
 
+	// --- Connect to the Remote WebDriver ---
+	log.Printf("Connecting to Selenium WebDriver at %s...", seleniumURL)
+	caps := selenium.Capabilities{"browserName": "chrome"}
+	chromeCaps := selenium.ChromeOptions{
+		Args: []string{
+			"--headless",
+			"--no-sandbox",
+			"--disable-dev-shm-usage",
+			"--disable-gpu",
+		},
+	}
+	caps.AddChrome(chromeCaps)
+
+	// This is the key change: connect to the remote URL instead of starting a local service.
+	wd, err := selenium.NewRemote(caps, seleniumURL)
+	if err != nil {
+		log.Fatalf("Failed to open session with WebDriver: %v", err)
+	}
+	defer func() {
+		if err := wd.Quit(); err != nil {
+			log.Printf("Failed to quit WebDriver session: %v", err)
+		}
+	}()
+	log.Println("Selenium WebDriver session started successfully.")
+
+	// --- Start gRPC Server ---
 	lis, err := net.Listen("tcp", fmt.Sprintf(":%s", port))
 	if err != nil {
 		log.Fatalf("failed to listen: %v", err)
 	}
 
 	grpcServer := grpc.NewServer()
-	server, err := newServer(cacheDir)
+	server, err := newServer(cacheDir, wd) // Pass WebDriver to the server
 	if err != nil {
 		log.Fatalf("failed to create server: %v", err)
 	}
-	
+
 	pb.RegisterDownloadCacheServer(grpcServer, server)
-	// Enable reflection for tools like grpcurl to inspect the service.
 	reflection.Register(grpcServer)
 
 	log.Printf("gRPC server listening on port %s", port)
