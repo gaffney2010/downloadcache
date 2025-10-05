@@ -199,16 +199,16 @@ func main() {
 
 	// --- Connect to the Remote WebDriver ---
 	log.Printf("Connecting to Selenium WebDriver at %s...", seleniumURL)
-	caps := selenium.Capabilities{"browserName": "chrome"}
-	chromeCaps := selenium.ChromeOptions{
-		Args: []string{
-			"--headless",
-			"--no-sandbox",
-			"--disable-dev-shm-usage",
-			"--disable-gpu",
-		},
-	}
-	caps.AddChrome(chromeCaps)
+  caps := selenium.Capabilities{"browserName": "chrome"}
+  chromeCaps := map[string]interface{}{
+      "args": []string{
+          "--headless",
+          "--no-sandbox",
+          "--disable-dev-shm-usage",
+          "--disable-gpu",
+      },
+  }
+  caps["goog:chromeOptions"] = chromeCaps
 
 	// This is the key change: connect to the remote URL instead of starting a local service.
 	wd, err := selenium.NewRemote(caps, seleniumURL)
