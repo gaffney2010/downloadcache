@@ -25,23 +25,21 @@ import (
 )
 
 const (
-	defaultPort             = "50051"
-	defaultCacheDir         = "/cache"                // This path will be used inside the Docker container
-	defaultChromeDriverPath = "/usr/bin/chromedriver" // Common path in Docker images
-	defaultSeleniumPort     = "9515"
+	defaultPort     = "50051"
+	defaultCacheDir = "/cache" // This path will be used inside the Docker container
 )
 
 // downloadCacheServer implements the DownloadCacheServiceServer interface.
 type downloadCacheServer struct {
 	pb.UnimplementedDownloadCacheServer
-	cacheDir string
-	minifier *minify.M
-	wd       selenium.WebDriver // Selenium WebDriver instance
-	urlLocks sync.Map           // Used to prevent concurrent downloads of the same URL
+	cacheDir    string
+	minifier    *minify.M
+	seleniumURL string   // Stores the URL to the remote Selenium instance
+	urlLocks    sync.Map // Used to prevent concurrent downloads of the same URL
 }
 
 // newServer creates a new instance of our server.
-func newServer(cacheDir string, wd selenium.WebDriver) (*downloadCacheServer, error) {
+func newServer(cacheDir string, seleniumURL string) (*downloadCacheServer, error) {
 	if err := os.MkdirAll(cacheDir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create cache directory: %w", err)
 	}
@@ -52,9 +50,9 @@ func newServer(cacheDir string, wd selenium.WebDriver) (*downloadCacheServer, er
 	log.Printf("Cache directory initialized at: %s", cacheDir)
 
 	return &downloadCacheServer{
-		cacheDir: cacheDir,
-		minifier: m,
-		wd:       wd,
+		cacheDir:    cacheDir,
+		minifier:    m,
+		seleniumURL: seleniumURL,
 	}, nil
 }
 
@@ -110,18 +108,40 @@ func (s *downloadCacheServer) downloadAndCache(rawURL, cacheFilePath string) (*p
 		}
 	}
 
-	// --- Selenium Page Fetch ---
+	// --- Selenium Session Management ---
+	// Create a new WebDriver session for this specific request.
+	caps := selenium.Capabilities{"browserName": "chrome"}
+	chromeCaps := map[string]interface{}{
+		"args": []string{
+			"--headless",
+			"--no-sandbox",
+			"--disable-dev-shm-usage",
+			"--disable-gpu",
+		},
+	}
+	caps["goog:chromeOptions"] = chromeCaps
+
+	wd, err := selenium.NewRemote(caps, s.seleniumURL)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to open session with WebDriver: %v", err)
+	}
+	// Use defer to ensure the session is always closed when this function exits.
+	defer func() {
+		if err := wd.Quit(); err != nil {
+			log.Printf("Failed to quit WebDriver session: %v", err)
+		}
+	}()
+	// --- End of Session Management ---
+
 	log.Printf("Fetching URL with Selenium: %s", rawURL)
-	if err := s.wd.Get(rawURL); err != nil {
+	if err := wd.Get(rawURL); err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to navigate to URL with Selenium %s: %v", rawURL, err)
 	}
 
-	// Optional: Wait for a specific element or just a fixed time for JavaScript to render.
-	// For production, a more robust explicit wait for an element is better.
-	// Example: s.wd.Wait(selenium.Until(selenium.TitleContains("Example")), 10*time.Second)
+	// Optional: Wait for JS to render.
 	time.Sleep(2 * time.Second)
 
-	pageSource, err := s.wd.PageSource()
+	pageSource, err := wd.PageSource()
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to get page source from Selenium: %v", err)
 	}
@@ -197,31 +217,6 @@ func main() {
 		log.Fatalf("SELENIUM_URL environment variable not set")
 	}
 
-	// --- Connect to the Remote WebDriver ---
-	log.Printf("Connecting to Selenium WebDriver at %s...", seleniumURL)
-  caps := selenium.Capabilities{"browserName": "chrome"}
-  chromeCaps := map[string]interface{}{
-      "args": []string{
-          "--headless",
-          "--no-sandbox",
-          "--disable-dev-shm-usage",
-          "--disable-gpu",
-      },
-  }
-  caps["goog:chromeOptions"] = chromeCaps
-
-	// This is the key change: connect to the remote URL instead of starting a local service.
-	wd, err := selenium.NewRemote(caps, seleniumURL)
-	if err != nil {
-		log.Fatalf("Failed to open session with WebDriver: %v", err)
-	}
-	defer func() {
-		if err := wd.Quit(); err != nil {
-			log.Printf("Failed to quit WebDriver session: %v", err)
-		}
-	}()
-	log.Println("Selenium WebDriver session started successfully.")
-
 	// --- Start gRPC Server ---
 	lis, err := net.Listen("tcp", fmt.Sprintf(":%s", port))
 	if err != nil {
@@ -229,12 +224,14 @@ func main() {
 	}
 
 	grpcServer := grpc.NewServer()
-	server, err := newServer(cacheDir, wd) // Pass WebDriver to the server
+	// Pass the seleniumURL string, not the WebDriver instance
+	server, err := newServer(cacheDir, seleniumURL)
 	if err != nil {
 		log.Fatalf("failed to create server: %v", err)
 	}
 
 	pb.RegisterDownloadCacheServer(grpcServer, server)
+	// Enable reflection for tools like grpcurl to inspect the service.
 	reflection.Register(grpcServer)
 
 	log.Printf("gRPC server listening on port %s", port)
