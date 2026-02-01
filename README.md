@@ -15,6 +15,16 @@ Build the Docker image:
 docker build -t downloadcache-service .
 ```
 
+## Run
+
+Use `-v` to mount a local directory as the cache so that cached pages persist across container restarts:
+
+```bash
+docker run -p 50051:50051 -v ./my_cache:/cache downloadcache-service
+```
+
+Without `-v`, the cache lives inside the container and is lost when the container is removed.
+
 ## Configuration
 
 | Variable | Default | Description |
