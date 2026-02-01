@@ -7,13 +7,14 @@ import downloadcache_pb2
 import downloadcache_pb2_grpc
 
 
-def run(host: str, url: str, invalidate: bool) -> None:
+def run(host: str, url: str, invalidate: bool, user_agent: str = "") -> None:
     with grpc.insecure_channel(host) as channel:
         stub = downloadcache_pb2_grpc.DownloadCacheStub(channel)
 
         request = downloadcache_pb2.DownloadCacheRequest(
             url=url,
             invalidate=invalidate,
+            user_agent=user_agent,
         )
 
         print(f"Requesting: {url} (invalidate={invalidate})")
@@ -42,6 +43,11 @@ if __name__ == "__main__":
         action="store_true",
         help="Force re-download, bypassing the cache",
     )
+    parser.add_argument(
+        "--user-agent",
+        default="",
+        help="Custom User-Agent header for the fetch request",
+    )
     args = parser.parse_args()
 
-    run(args.host, args.url, args.invalidate)
+    run(args.host, args.url, args.invalidate, args.user_agent)

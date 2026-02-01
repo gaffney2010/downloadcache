@@ -90,13 +90,20 @@ func (s *downloadCacheServer) Get(ctx context.Context, req *pb.DownloadCacheRequ
 
 	// --- Download & Process ---
 	log.Printf("Cache MISS or invalidation for URL: %s", req.GetUrl())
-	return s.downloadAndCache(req.GetUrl(), cacheFilePath)
+	return s.downloadAndCache(req.GetUrl(), cacheFilePath, req.GetUserAgent())
 }
 
 // fetchWithHTTP fetches a URL using a plain HTTP GET request.
-func (s *downloadCacheServer) fetchWithHTTP(rawURL string) ([]byte, error) {
+func (s *downloadCacheServer) fetchWithHTTP(rawURL string, userAgent string) ([]byte, error) {
 	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Get(rawURL)
+	req, err := http.NewRequest("GET", rawURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create HTTP request: %w", err)
+	}
+	if userAgent != "" {
+		req.Header.Set("User-Agent", userAgent)
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("HTTP GET failed: %w", err)
 	}
@@ -114,15 +121,19 @@ func (s *downloadCacheServer) fetchWithHTTP(rawURL string) ([]byte, error) {
 }
 
 // fetchWithSelenium fetches a URL using a remote Selenium WebDriver.
-func (s *downloadCacheServer) fetchWithSelenium(rawURL string) ([]byte, error) {
+func (s *downloadCacheServer) fetchWithSelenium(rawURL string, userAgent string) ([]byte, error) {
 	caps := selenium.Capabilities{"browserName": "chrome"}
+	args := []string{
+		"--headless",
+		"--no-sandbox",
+		"--disable-dev-shm-usage",
+		"--disable-gpu",
+	}
+	if userAgent != "" {
+		args = append(args, "--user-agent="+userAgent)
+	}
 	chromeCaps := map[string]interface{}{
-		"args": []string{
-			"--headless",
-			"--no-sandbox",
-			"--disable-dev-shm-usage",
-			"--disable-gpu",
-		},
+		"args": args,
 	}
 	caps["goog:chromeOptions"] = chromeCaps
 
@@ -152,7 +163,7 @@ func (s *downloadCacheServer) fetchWithSelenium(rawURL string) ([]byte, error) {
 }
 
 // downloadAndCache handles the logic for downloading, processing, and caching a URL.
-func (s *downloadCacheServer) downloadAndCache(rawURL, cacheFilePath string) (*pb.DownloadCacheResponse, error) {
+func (s *downloadCacheServer) downloadAndCache(rawURL, cacheFilePath string, userAgent string) (*pb.DownloadCacheResponse, error) {
 	// Lock per URL to ensure only one goroutine downloads a specific URL at a time.
 	mu, _ := s.urlLocks.LoadOrStore(rawURL, &sync.Mutex{})
 	mutex := mu.(*sync.Mutex)
@@ -174,9 +185,9 @@ func (s *downloadCacheServer) downloadAndCache(rawURL, cacheFilePath string) (*p
 	var err error
 	switch s.fetchMode {
 	case "selenium":
-		bodyBytes, err = s.fetchWithSelenium(rawURL)
+		bodyBytes, err = s.fetchWithSelenium(rawURL, userAgent)
 	default:
-		bodyBytes, err = s.fetchWithHTTP(rawURL)
+		bodyBytes, err = s.fetchWithHTTP(rawURL, userAgent)
 	}
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "fetch failed: %v", err)

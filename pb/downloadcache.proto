@@ -3,7 +3,7 @@ syntax = "proto3";
 package downloadcache;
 
 // The go_package option specifies the import path for the generated Go code.
-option go_package = "github.com/your-username/downloadcache/pb";
+option go_package = "downloadcache/pb";
 
 // The DownloadCache service definition.
 service DownloadCache {
@@ -15,6 +15,7 @@ service DownloadCache {
 message DownloadCacheRequest {
   string url = 1;
   bool invalidate = 2;
+  string user_agent = 3;
 }
 
 // The response message containing the page contents.
