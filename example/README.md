@@ -8,8 +8,21 @@ Build and run the Docker container from the repo root:
 
 ```bash
 docker build -t downloadcache-service .
-docker run -p 50051:50051 downloadcache-service
+docker run -p 50051:50051 -v ./my_cache:/cache downloadcache-service
 ```
+
+This starts the service in the default HTTP fetch mode, which requires no additional containers.
+
+For pages that need JavaScript rendering, use Selenium mode instead:
+
+```bash
+docker run -p 50051:50051 -v ./my_cache:/cache \
+  -e FETCH_MODE=selenium \
+  -e SELENIUM_URL=http://selenium:4444/wd/hub \
+  downloadcache-service
+```
+
+See the root README for a full docker-compose setup with Selenium.
 
 ## Setup
 

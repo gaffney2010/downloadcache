@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -34,12 +35,13 @@ type downloadCacheServer struct {
 	pb.UnimplementedDownloadCacheServer
 	cacheDir    string
 	minifier    *minify.M
+	fetchMode   string   // "http" or "selenium"
 	seleniumURL string   // Stores the URL to the remote Selenium instance
 	urlLocks    sync.Map // Used to prevent concurrent downloads of the same URL
 }
 
 // newServer creates a new instance of our server.
-func newServer(cacheDir string, seleniumURL string) (*downloadCacheServer, error) {
+func newServer(cacheDir string, fetchMode string, seleniumURL string) (*downloadCacheServer, error) {
 	if err := os.MkdirAll(cacheDir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create cache directory: %w", err)
 	}
@@ -52,6 +54,7 @@ func newServer(cacheDir string, seleniumURL string) (*downloadCacheServer, error
 	return &downloadCacheServer{
 		cacheDir:    cacheDir,
 		minifier:    m,
+		fetchMode:   fetchMode,
 		seleniumURL: seleniumURL,
 	}, nil
 }
@@ -90,7 +93,65 @@ func (s *downloadCacheServer) Get(ctx context.Context, req *pb.DownloadCacheRequ
 	return s.downloadAndCache(req.GetUrl(), cacheFilePath)
 }
 
-// downloadAndCache handles the logic for downloading, processing, and caching a URL using Selenium.
+// fetchWithHTTP fetches a URL using a plain HTTP GET request.
+func (s *downloadCacheServer) fetchWithHTTP(rawURL string) ([]byte, error) {
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Get(rawURL)
+	if err != nil {
+		return nil, fmt.Errorf("HTTP GET failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("HTTP GET returned status %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read HTTP response body: %w", err)
+	}
+	return body, nil
+}
+
+// fetchWithSelenium fetches a URL using a remote Selenium WebDriver.
+func (s *downloadCacheServer) fetchWithSelenium(rawURL string) ([]byte, error) {
+	caps := selenium.Capabilities{"browserName": "chrome"}
+	chromeCaps := map[string]interface{}{
+		"args": []string{
+			"--headless",
+			"--no-sandbox",
+			"--disable-dev-shm-usage",
+			"--disable-gpu",
+		},
+	}
+	caps["goog:chromeOptions"] = chromeCaps
+
+	wd, err := selenium.NewRemote(caps, s.seleniumURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open session with WebDriver: %w", err)
+	}
+	defer func() {
+		if err := wd.Quit(); err != nil {
+			log.Printf("Failed to quit WebDriver session: %v", err)
+		}
+	}()
+
+	log.Printf("Fetching URL with Selenium: %s", rawURL)
+	if err := wd.Get(rawURL); err != nil {
+		return nil, fmt.Errorf("failed to navigate to URL with Selenium %s: %w", rawURL, err)
+	}
+
+	// Wait for JS to render.
+	time.Sleep(2 * time.Second)
+
+	pageSource, err := wd.PageSource()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get page source from Selenium: %w", err)
+	}
+	return []byte(pageSource), nil
+}
+
+// downloadAndCache handles the logic for downloading, processing, and caching a URL.
 func (s *downloadCacheServer) downloadAndCache(rawURL, cacheFilePath string) (*pb.DownloadCacheResponse, error) {
 	// Lock per URL to ensure only one goroutine downloads a specific URL at a time.
 	mu, _ := s.urlLocks.LoadOrStore(rawURL, &sync.Mutex{})
@@ -108,44 +169,18 @@ func (s *downloadCacheServer) downloadAndCache(rawURL, cacheFilePath string) (*p
 		}
 	}
 
-	// --- Selenium Session Management ---
-	// Create a new WebDriver session for this specific request.
-	caps := selenium.Capabilities{"browserName": "chrome"}
-	chromeCaps := map[string]interface{}{
-		"args": []string{
-			"--headless",
-			"--no-sandbox",
-			"--disable-dev-shm-usage",
-			"--disable-gpu",
-		},
+	// Fetch page content using the configured mode.
+	var bodyBytes []byte
+	var err error
+	switch s.fetchMode {
+	case "selenium":
+		bodyBytes, err = s.fetchWithSelenium(rawURL)
+	default:
+		bodyBytes, err = s.fetchWithHTTP(rawURL)
 	}
-	caps["goog:chromeOptions"] = chromeCaps
-
-	wd, err := selenium.NewRemote(caps, s.seleniumURL)
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to open session with WebDriver: %v", err)
+		return nil, status.Errorf(codes.Internal, "fetch failed: %v", err)
 	}
-	// Use defer to ensure the session is always closed when this function exits.
-	defer func() {
-		if err := wd.Quit(); err != nil {
-			log.Printf("Failed to quit WebDriver session: %v", err)
-		}
-	}()
-	// --- End of Session Management ---
-
-	log.Printf("Fetching URL with Selenium: %s", rawURL)
-	if err := wd.Get(rawURL); err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to navigate to URL with Selenium %s: %v", rawURL, err)
-	}
-
-	// Optional: Wait for JS to render.
-	time.Sleep(2 * time.Second)
-
-	pageSource, err := wd.PageSource()
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to get page source from Selenium: %v", err)
-	}
-	bodyBytes := []byte(pageSource)
 
 	// Minify the content.
 	minifiedBytes, err := s.minifier.Bytes("text/html", bodyBytes)
@@ -211,11 +246,18 @@ func main() {
 	if cacheDir == "" {
 		cacheDir = defaultCacheDir
 	}
-	// This URL will point to the Selenium container (e.g., "http://selenium:4444/wd/hub")
-	seleniumURL := os.Getenv("SELENIUM_URL")
-	if seleniumURL == "" {
-		log.Fatalf("SELENIUM_URL environment variable not set")
+
+	fetchMode := os.Getenv("FETCH_MODE")
+	if fetchMode == "" {
+		fetchMode = "http"
 	}
+
+	seleniumURL := os.Getenv("SELENIUM_URL")
+	if fetchMode == "selenium" && seleniumURL == "" {
+		log.Fatalf("SELENIUM_URL environment variable is required when FETCH_MODE=selenium")
+	}
+
+	log.Printf("Starting with FETCH_MODE=%s", fetchMode)
 
 	// --- Start gRPC Server ---
 	lis, err := net.Listen("tcp", fmt.Sprintf(":%s", port))
@@ -224,8 +266,7 @@ func main() {
 	}
 
 	grpcServer := grpc.NewServer()
-	// Pass the seleniumURL string, not the WebDriver instance
-	server, err := newServer(cacheDir, seleniumURL)
+	server, err := newServer(cacheDir, fetchMode, seleniumURL)
 	if err != nil {
 		log.Fatalf("failed to create server: %v", err)
 	}
