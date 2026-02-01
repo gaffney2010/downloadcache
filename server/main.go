@@ -90,7 +90,7 @@ func (s *downloadCacheServer) Get(ctx context.Context, req *pb.DownloadCacheRequ
 
 	// --- Download & Process ---
 	log.Printf("Cache MISS or invalidation for URL: %s", req.GetUrl())
-	return s.downloadAndCache(req.GetUrl(), cacheFilePath, req.GetUserAgent())
+	return s.downloadAndCache(req.GetUrl(), cacheFilePath, req.GetUserAgent(), req.GetSkipMinify())
 }
 
 // fetchWithHTTP fetches a URL using a plain HTTP GET request.
@@ -163,7 +163,7 @@ func (s *downloadCacheServer) fetchWithSelenium(rawURL string, userAgent string)
 }
 
 // downloadAndCache handles the logic for downloading, processing, and caching a URL.
-func (s *downloadCacheServer) downloadAndCache(rawURL, cacheFilePath string, userAgent string) (*pb.DownloadCacheResponse, error) {
+func (s *downloadCacheServer) downloadAndCache(rawURL, cacheFilePath string, userAgent string, skipMinify bool) (*pb.DownloadCacheResponse, error) {
 	// Lock per URL to ensure only one goroutine downloads a specific URL at a time.
 	mu, _ := s.urlLocks.LoadOrStore(rawURL, &sync.Mutex{})
 	mutex := mu.(*sync.Mutex)
@@ -193,11 +193,16 @@ func (s *downloadCacheServer) downloadAndCache(rawURL, cacheFilePath string, use
 		return nil, status.Errorf(codes.Internal, "fetch failed: %v", err)
 	}
 
-	// Minify the content.
-	minifiedBytes, err := s.minifier.Bytes("text/html", bodyBytes)
-	if err != nil {
-		log.Printf("Warning: failed to minify content for %s, using original. Error: %v", rawURL, err)
-		minifiedBytes = bodyBytes // Fallback to original content
+	// Minify the content unless the caller opted out.
+	var minifiedBytes []byte
+	if skipMinify {
+		minifiedBytes = bodyBytes
+	} else {
+		minifiedBytes, err = s.minifier.Bytes("text/html", bodyBytes)
+		if err != nil {
+			log.Printf("Warning: failed to minify content for %s, using original. Error: %v", rawURL, err)
+			minifiedBytes = bodyBytes
+		}
 	}
 
 	// Write the minified and gzipped content to the cache file.

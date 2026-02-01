@@ -16,6 +16,7 @@ message DownloadCacheRequest {
   string url = 1;
   bool invalidate = 2;
   string user_agent = 3;
+  bool skip_minify = 4;
 }
 
 // The response message containing the page contents.
